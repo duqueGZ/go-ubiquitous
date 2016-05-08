@@ -1,3 +1,7 @@
+Udacity Android Developer Nanodegree. Project 6
+
+Built from Advanced Android Sample App (Sunshine app): https://github.com/udacity/Advanced_Android_Development/tree/7.05_Pretty_Wallpaper_Time
+
 Advanced Android Sample App
 ===================================
 
