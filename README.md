@@ -1,6 +1,25 @@
 Udacity Android Developer Nanodegree. Project 6
 
-Built from Advanced Android Sample App (Sunshine app): https://github.com/udacity/Advanced_Android_Development/tree/7.05_Pretty_Wallpaper_Time
+In order to make the app works correctly is needed to configure and use a openweathermap.org API KEY.
+To get one, you must to sign up for an account in their webpage and then look for your API KEY through your profile page.
+Since it is not allowed to publicly share your personal API KEY, the code in this repository does not contain mine. So, 
+once you have the API KEY, it would be needed to replace *'MyOpenWeatherMapApiKey'* placeholder in app *build.gradle* file by your real and valid API KEY value:
+
+app/build.gradle:
+```gradle
+apply plugin: 'com.android.application'
+apply plugin: 'com.google.gms.google-services'
+
+android {
+    ...
+    buildTypes.each {
+        it.buildConfigField 'String', 'OPEN_WEATHER_MAP_API_KEY', '\"MyOpenWeatherMapApiKey\"'
+    }
+}
+...
+```
+
+This project has been developed taking as a starting point the Advanced Android Sample App (Sunshine app): https://github.com/udacity/Advanced_Android_Development/tree/7.05_Pretty_Wallpaper_Time
 
 Advanced Android Sample App
 ===================================
