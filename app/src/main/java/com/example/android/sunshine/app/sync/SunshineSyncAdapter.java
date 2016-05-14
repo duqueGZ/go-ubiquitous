@@ -36,12 +36,21 @@ import com.example.android.sunshine.app.R;
 import com.example.android.sunshine.app.Utility;
 import com.example.android.sunshine.app.data.WeatherContract;
 import com.example.android.sunshine.app.muzei.WeatherMuzeiSource;
+import com.google.android.gms.common.ConnectionResult;
+import com.google.android.gms.common.api.GoogleApiClient;
+import com.google.android.gms.common.api.ResultCallback;
+import com.google.android.gms.wearable.Asset;
+import com.google.android.gms.wearable.DataApi;
+import com.google.android.gms.wearable.PutDataMapRequest;
+import com.google.android.gms.wearable.PutDataRequest;
+import com.google.android.gms.wearable.Wearable;
 
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -52,7 +61,16 @@ import java.net.URL;
 import java.util.Vector;
 import java.util.concurrent.ExecutionException;
 
-public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
+public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements
+        GoogleApiClient.ConnectionCallbacks,
+        GoogleApiClient.OnConnectionFailedListener {
+
+    private static final String WATCH_FACE_DATA_PATH = "/sunshine-watch-face-data";
+    private static final String WATCH_FACE_HIGH_TEMP_KEY = "high-temp";
+    private static final String WATCH_FACE_LOW_TEMP_KEY = "low-temp";
+    private static final String WATCH_FACE_WEATHER_ICON_KEY = "weather-icon";
+    private static final String WATCH_FACE_DATA_TIMESTAMP_KEY = "timestamp";
+
     public final String LOG_TAG = SunshineSyncAdapter.class.getSimpleName();
     public static final String ACTION_DATA_UPDATED =
             "com.example.android.sunshine.app.ACTION_DATA_UPDATED";
@@ -77,6 +95,8 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
     private static final int INDEX_MIN_TEMP = 2;
     private static final int INDEX_SHORT_DESC = 3;
 
+    private GoogleApiClient mGoogleApiClient;
+
     @Retention(RetentionPolicy.SOURCE)
     @IntDef({LOCATION_STATUS_OK, LOCATION_STATUS_SERVER_DOWN, LOCATION_STATUS_SERVER_INVALID,  LOCATION_STATUS_UNKNOWN, LOCATION_STATUS_INVALID})
     public @interface LocationStatus {}
@@ -89,11 +109,24 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
 
     public SunshineSyncAdapter(Context context, boolean autoInitialize) {
         super(context, autoInitialize);
+
+        mGoogleApiClient = new GoogleApiClient.Builder(context)
+                .addApi(Wearable.API)
+                .addConnectionCallbacks(this)
+                .addOnConnectionFailedListener(this)
+                .build();
+
+        mGoogleApiClient.connect();
     }
 
     @Override
     public void onPerformSync(Account account, Bundle extras, String authority, ContentProviderClient provider, SyncResult syncResult) {
         Log.d(LOG_TAG, "Starting sync");
+
+        if (!mGoogleApiClient.isConnected()) {
+            mGoogleApiClient.connect();
+        }
+
         String locationQuery = Utility.getPreferredLocation(getContext());
 
         // These two need to be declared outside the try/catch
@@ -346,7 +379,7 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
 
                 updateWidgets();
                 updateMuzei();
-                notifyWeather();
+                notifyWeatherAndSendWatchFaceData();
             }
             Log.d(LOG_TAG, "Sync Complete. " + cVVector.size() + " Inserted");
             setLocationStatus(getContext(), LOCATION_STATUS_OK);
@@ -376,110 +409,181 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
         }
     }
 
-    private void notifyWeather() {
-        Context context = getContext();
-        //checking the last update and notify if it' the first of the day
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+    private void notifyWeatherAndSendWatchFaceData() {
+
+        final Context context = getContext();
+        Resources resources = context.getResources();
+
+        // Checking the last update and notify if it' the first of the day
+        final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+
         String displayNotificationsKey = context.getString(R.string.pref_enable_notifications_key);
+        String lastNotificationKey = context.getString(R.string.pref_last_notification);
+        final String lastWatchFaceHighTempKey =
+                context.getString(R.string.pref_last_watch_face_high_temp_key);
+        final String lastWatchFaceLowTempKey =
+                context.getString(R.string.pref_last_watch_face_low_temp_key);
+        final String lastWatchFaceWeatherIdKey =
+                context.getString(R.string.pref_last_watch_face_weather_id_key);
+
         boolean displayNotifications = prefs.getBoolean(displayNotificationsKey,
                 Boolean.parseBoolean(context.getString(R.string.pref_enable_notifications_default)));
+        long lastSync = prefs.getLong(lastNotificationKey, 0);
+        displayNotifications = displayNotifications
+                && (System.currentTimeMillis() - lastSync >= DAY_IN_MILLIS);
 
-        if ( displayNotifications ) {
+        String lastWatchFaceHighTemp = prefs.getString(lastWatchFaceHighTempKey, "");
+        String lastWatchFaceLowTemp = prefs.getString(lastWatchFaceLowTempKey, "");
+        int lastWatchFaceWeatherId = prefs.getInt(lastWatchFaceWeatherIdKey, -1);
 
-            String lastNotificationKey = context.getString(R.string.pref_last_notification);
-            long lastSync = prefs.getLong(lastNotificationKey, 0);
+        // Retrieve needed data
+        String locationQuery = Utility.getPreferredLocation(context);
+        Uri weatherUri = WeatherContract.WeatherEntry.buildWeatherLocationWithDate(locationQuery, System.currentTimeMillis());
+        // we'll query our contentProvider, as always
+        Cursor cursor = context.getContentResolver().query(weatherUri, NOTIFY_WEATHER_PROJECTION, null, null, null);
 
-            if (System.currentTimeMillis() - lastSync >= DAY_IN_MILLIS) {
-                // Last sync was more than 1 day ago, let's send a notification with the weather.
-                String locationQuery = Utility.getPreferredLocation(context);
+        String desc = null;
+        int iconId = -1;
+        int weatherId = -1;
+        double high = -1;
+        double low = -1;
+        Bitmap largeIcon = null;
+        boolean retrievedData = Boolean.FALSE;
+        if (cursor.moveToFirst()) {
+            retrievedData = Boolean.TRUE;
+            weatherId = cursor.getInt(INDEX_WEATHER_ID);
+            high = cursor.getDouble(INDEX_MAX_TEMP);
+            low = cursor.getDouble(INDEX_MIN_TEMP);
+            desc = cursor.getString(INDEX_SHORT_DESC);
 
-                Uri weatherUri = WeatherContract.WeatherEntry.buildWeatherLocationWithDate(locationQuery, System.currentTimeMillis());
+            iconId = Utility.getIconResourceForWeatherCondition(weatherId);
+            int artResourceId = Utility.getArtResourceForWeatherCondition(weatherId);
+            String artUrl = Utility.getArtUrlForWeatherCondition(context, weatherId);
 
-                // we'll query our contentProvider, as always
-                Cursor cursor = context.getContentResolver().query(weatherUri, NOTIFY_WEATHER_PROJECTION, null, null, null);
+            // On Honeycomb and higher devices, we can retrieve the size of the large icon
+            // Prior to that, we use a fixed size
+            @SuppressLint("InlinedApi")
+            int largeIconWidth = Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB
+                    ? resources.getDimensionPixelSize(android.R.dimen.notification_large_icon_width)
+                    : resources.getDimensionPixelSize(R.dimen.notification_large_icon_default);
+            @SuppressLint("InlinedApi")
+            int largeIconHeight = Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB
+                    ? resources.getDimensionPixelSize(android.R.dimen.notification_large_icon_height)
+                    : resources.getDimensionPixelSize(R.dimen.notification_large_icon_default);
 
-                if (cursor.moveToFirst()) {
-                    int weatherId = cursor.getInt(INDEX_WEATHER_ID);
-                    double high = cursor.getDouble(INDEX_MAX_TEMP);
-                    double low = cursor.getDouble(INDEX_MIN_TEMP);
-                    String desc = cursor.getString(INDEX_SHORT_DESC);
-
-                    int iconId = Utility.getIconResourceForWeatherCondition(weatherId);
-                    Resources resources = context.getResources();
-                    int artResourceId = Utility.getArtResourceForWeatherCondition(weatherId);
-                    String artUrl = Utility.getArtUrlForWeatherCondition(context, weatherId);
-
-                    // On Honeycomb and higher devices, we can retrieve the size of the large icon
-                    // Prior to that, we use a fixed size
-                    @SuppressLint("InlinedApi")
-                    int largeIconWidth = Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB
-                            ? resources.getDimensionPixelSize(android.R.dimen.notification_large_icon_width)
-                            : resources.getDimensionPixelSize(R.dimen.notification_large_icon_default);
-                    @SuppressLint("InlinedApi")
-                    int largeIconHeight = Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB
-                            ? resources.getDimensionPixelSize(android.R.dimen.notification_large_icon_height)
-                            : resources.getDimensionPixelSize(R.dimen.notification_large_icon_default);
-
-                    // Retrieve the large icon
-                    Bitmap largeIcon;
-                    try {
-                        largeIcon = Glide.with(context)
-                                .load(artUrl)
-                                .asBitmap()
-                                .error(artResourceId)
-                                .fitCenter()
-                                .into(largeIconWidth, largeIconHeight).get();
-                    } catch (InterruptedException | ExecutionException e) {
-                        Log.e(LOG_TAG, "Error retrieving large icon from " + artUrl, e);
-                        largeIcon = BitmapFactory.decodeResource(resources, artResourceId);
-                    }
-                    String title = context.getString(R.string.app_name);
-
-                    // Define the text of the forecast.
-                    String contentText = String.format(context.getString(R.string.format_notification),
-                            desc,
-                            Utility.formatTemperature(context, high),
-                            Utility.formatTemperature(context, low));
-
-                    // NotificationCompatBuilder is a very convenient way to build backward-compatible
-                    // notifications.  Just throw in some data.
-                    NotificationCompat.Builder mBuilder =
-                            new NotificationCompat.Builder(getContext())
-                                    .setColor(resources.getColor(R.color.primary_light))
-                                    .setSmallIcon(iconId)
-                                    .setLargeIcon(largeIcon)
-                                    .setContentTitle(title)
-                                    .setContentText(contentText);
-
-                    // Make something interesting happen when the user clicks on the notification.
-                    // In this case, opening the app is sufficient.
-                    Intent resultIntent = new Intent(context, MainActivity.class);
-
-                    // The stack builder object will contain an artificial back stack for the
-                    // started Activity.
-                    // This ensures that navigating backward from the Activity leads out of
-                    // your application to the Home screen.
-                    TaskStackBuilder stackBuilder = TaskStackBuilder.create(context);
-                    stackBuilder.addNextIntent(resultIntent);
-                    PendingIntent resultPendingIntent =
-                            stackBuilder.getPendingIntent(
-                                    0,
-                                    PendingIntent.FLAG_UPDATE_CURRENT
-                            );
-                    mBuilder.setContentIntent(resultPendingIntent);
-
-                    NotificationManager mNotificationManager =
-                            (NotificationManager) getContext().getSystemService(Context.NOTIFICATION_SERVICE);
-                    // WEATHER_NOTIFICATION_ID allows you to update the notification later on.
-                    mNotificationManager.notify(WEATHER_NOTIFICATION_ID, mBuilder.build());
-
-                    //refreshing last sync
-                    SharedPreferences.Editor editor = prefs.edit();
-                    editor.putLong(lastNotificationKey, System.currentTimeMillis());
-                    editor.commit();
-                }
-                cursor.close();
+            // Retrieve the large icon
+            try {
+                largeIcon = Glide.with(context)
+                        .load(artUrl)
+                        .asBitmap()
+                        .error(artResourceId)
+                        .fitCenter()
+                        .into(largeIconWidth, largeIconHeight).get();
+            } catch (InterruptedException | ExecutionException e) {
+                Log.e(LOG_TAG, "Error retrieving large icon from " + artUrl, e);
+                largeIcon = BitmapFactory.decodeResource(resources, artResourceId);
             }
+        }
+        cursor.close();
+
+        if ((displayNotifications) && (retrievedData)) {
+
+            // Last sync was more than 1 day ago, let's send a notification with the weather.
+            String title = context.getString(R.string.app_name);
+
+            // Define the text of the forecast.
+            String contentText = String.format(context.getString(R.string.format_notification),
+                    desc,
+                    Utility.formatTemperature(context, high),
+                    Utility.formatTemperature(context, low));
+
+            // NotificationCompatBuilder is a very convenient way to build backward-compatible
+            // notifications.  Just throw in some data.
+            NotificationCompat.Builder mBuilder =
+                    new NotificationCompat.Builder(getContext())
+                            .setColor(resources.getColor(R.color.primary_light))
+                            .setSmallIcon(iconId)
+                            .setLargeIcon(largeIcon)
+                            .setContentTitle(title)
+                            .setContentText(contentText);
+
+            // Make something interesting happen when the user clicks on the notification.
+            // In this case, opening the app is sufficient.
+            Intent resultIntent = new Intent(context, MainActivity.class);
+
+            // The stack builder object will contain an artificial back stack for the
+            // started Activity.
+            // This ensures that navigating backward from the Activity leads out of
+            // your application to the Home screen.
+            TaskStackBuilder stackBuilder = TaskStackBuilder.create(context);
+            stackBuilder.addNextIntent(resultIntent);
+            PendingIntent resultPendingIntent =
+                    stackBuilder.getPendingIntent(
+                            0,
+                            PendingIntent.FLAG_UPDATE_CURRENT
+                    );
+            mBuilder.setContentIntent(resultPendingIntent);
+
+            NotificationManager mNotificationManager =
+                    (NotificationManager) getContext()
+                            .getSystemService(Context.NOTIFICATION_SERVICE);
+            // WEATHER_NOTIFICATION_ID allows you to update the notification later on.
+            mNotificationManager.notify(WEATHER_NOTIFICATION_ID, mBuilder.build());
+
+            // Refreshing last sync
+            SharedPreferences.Editor editor = prefs.edit();
+            editor.putLong(lastNotificationKey, System.currentTimeMillis());
+            editor.commit();
+        }
+
+        // Send (if needed) watch face data
+        final String watchFaceHighTempText = Utility.formatTemperature(context, high);
+        final String watchFaceLowTempText = Utility.formatTemperature(context, low);
+        final int watchFaceWeatherId = weatherId;
+
+        boolean sendWatchFaceData = ((!lastWatchFaceHighTemp.equals(watchFaceHighTempText))
+                || (!lastWatchFaceLowTemp.equals(watchFaceLowTempText))
+                || (lastWatchFaceWeatherId!=watchFaceWeatherId));
+        if ((sendWatchFaceData) && (retrievedData) && (mGoogleApiClient.isConnected())) {
+
+            PutDataMapRequest dataMap = PutDataMapRequest
+                    .create(SunshineSyncAdapter.WATCH_FACE_DATA_PATH);
+
+            if (!lastWatchFaceHighTemp.equals(watchFaceHighTempText)) {
+                dataMap.getDataMap().putString(SunshineSyncAdapter.WATCH_FACE_HIGH_TEMP_KEY,
+                        watchFaceHighTempText);
+            }
+            if (!lastWatchFaceLowTemp.equals(watchFaceLowTempText)) {
+                dataMap.getDataMap().putString(SunshineSyncAdapter.WATCH_FACE_LOW_TEMP_KEY,
+                        watchFaceLowTempText);
+            }
+            if (lastWatchFaceWeatherId!=watchFaceWeatherId) {
+                dataMap.getDataMap().putAsset(SunshineSyncAdapter.WATCH_FACE_WEATHER_ICON_KEY,
+                        toAsset(largeIcon));
+            }
+            dataMap.getDataMap().putLong(SunshineSyncAdapter.WATCH_FACE_DATA_TIMESTAMP_KEY,
+                    System.currentTimeMillis());
+
+            PutDataRequest request = dataMap.asPutDataRequest();
+            request.setUrgent();
+
+            Wearable.DataApi.putDataItem(mGoogleApiClient, request)
+                    .setResultCallback(new ResultCallback<DataApi.DataItemResult>() {
+                        @Override
+                        public void onResult(DataApi.DataItemResult dataItemResult) {
+                            Log.d(LOG_TAG, "Sending data (" + watchFaceHighTempText + " - "
+                                    + watchFaceLowTempText + " - " + watchFaceWeatherId
+                                    + ") was successful: "
+                                    + dataItemResult.getStatus().isSuccess());
+
+                            // Refreshing last data sent to watch face
+                            SharedPreferences.Editor editor = prefs.edit();
+                            editor.putString(lastWatchFaceHighTempKey, watchFaceHighTempText);
+                            editor.putString(lastWatchFaceLowTempKey, watchFaceLowTempText);
+                            editor.putInt(lastWatchFaceWeatherIdKey, watchFaceWeatherId);
+                            editor.commit();
+                        }
+                    });
         }
     }
 
@@ -635,5 +739,40 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
         SharedPreferences.Editor spe = sp.edit();
         spe.putInt(c.getString(R.string.pref_location_status_key), locationStatus);
         spe.commit();
+    }
+
+    /**
+     * Builds an {@link com.google.android.gms.wearable.Asset} from a bitmap.
+     */
+    private static Asset toAsset(Bitmap bitmap) {
+        ByteArrayOutputStream byteStream = null;
+        try {
+            byteStream = new ByteArrayOutputStream();
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, byteStream);
+            return Asset.createFromBytes(byteStream.toByteArray());
+        } finally {
+            if (null != byteStream) {
+                try {
+                    byteStream.close();
+                } catch (IOException e) {
+                    // ignore
+                }
+            }
+        }
+    }
+
+    @Override
+    public void onConnected(Bundle connectionHint) {
+        Log.d(LOG_TAG, "Google API Client was connected");
+    }
+
+    @Override
+    public void onConnectionSuspended(int cause) {
+        Log.d(LOG_TAG, "Connection to Google API client was suspended");
+    }
+
+    @Override
+    public void onConnectionFailed(ConnectionResult result) {
+        Log.e(LOG_TAG, "Connection to Google API client has failed");
     }
 }

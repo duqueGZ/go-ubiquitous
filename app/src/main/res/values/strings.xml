@@ -136,6 +136,11 @@
     <!-- Strings related to Notification preference -->
     <string name="pref_last_notification">last_notification</string>
 
+    <!-- Strings related to Watch Face data passing -->
+    <string name="pref_last_watch_face_high_temp_key">last_watch_face_high_temp</string>
+    <string name="pref_last_watch_face_low_temp_key">last_watch_face_low_temp</string>
+    <string name="pref_last_watch_face_weather_id_key">last_watch_face_weather_id</string>
+
     <!-- Strings related to Widgets -->
     <string name="title_widget_today">Sunshine Today</string>
     <string name="title_widget_detail">Sunshine Details</string>

@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name" translatable="false">Sunshine</string>
     <string name="sunshine_watchface_name" translatable="false">Sunshine Watchface</string>
+    <string name="day_sdf">EEE, MMM dd yyyy</string>
 </resources>
